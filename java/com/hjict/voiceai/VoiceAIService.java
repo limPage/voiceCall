@@ -8,6 +8,7 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.media.AudioFormat;
 import android.media.AudioRecord;
+import android.media.MediaMetadataRetriever;
 import android.media.MediaRecorder;
 import android.os.Handler;
 import android.os.IBinder;
@@ -67,23 +68,20 @@ public class VoiceAIService extends Service {
     private String currentRecordingFile = null;
     private boolean isFirstRecording = true; // 첫 녹음 여부 추적
 
-    //    private static final String SELECTED_ENCODER = "whisper_encoder_base_10s.rknn";
-//    private static final String SELECTED_ENCODER = "static_whisper_base_ko_10s_encoder_ver05.rknn";
-    private static final String SELECTED_ENCODER = "static_whisper_base_ko_merged_spelling_ver0.2_10s_encoder.rknn";
-    //    private static final String SELECTED_DECODER = "whisper_decoder_base_10s.rknn";
-//    private static final String SELECTED_DECODER = "static_whisper_base_ko_10s_decoder_ver05.rknn";
-    private static final String SELECTED_DECODER = "static_whisper_base_ko_merged_spelling_ver0.2_10s_decoder.rknn";
+
     private static final String SELECTED_VOCAB = "vocab_ko.txt";
 
-    public static MyBroadcastReceiver receiver = null;
+    private BroadcastReceiver pjsipReceiver;
+//    private BroadcastReceiver keywordFetchReceiver;
 
-    public static IntentFilter intentFilter = null;
     // OkHttpClient를 클래스 멤버로 선언하여 단일 인스턴스 유지
     private OkHttpClient okHttpClient;
 
     private static final String LOG_SEPARATOR = "========= End of sending voice messages =========";
 
     private List<String> garbageKeywords = null; // Cache for file-based keywords
+
+    VoiceAINanoServer voiceAiServer;
 
     @Override
     public void onCreate() {
@@ -95,34 +93,61 @@ public class VoiceAIService extends Service {
         okHttpClient = new OkHttpClient();
 
         // IntentFilter 초기화
-        if (intentFilter == null) {
-            intentFilter = new IntentFilter();
-            intentFilter.addAction(H500.Intent.ACTION_PJSIP_END_CALL);
+        IntentFilter intentFilter = new IntentFilter(H500.Intent.ACTION_PJSIP_END_CALL);
+//        IntentFilter fetchFilter = new IntentFilter("com.hjict.voiceai.ACTION_FETCH_KEYWORDS"); //  이 부분 추가할 것
 
-            try{
-                Process process = Runtime.getRuntime().exec("chmod -R 777 " + getFilesDir());
-                process.waitFor();
-                if (process.exitValue() != 0) {
-                    Log.e(TAG, "Failed to set execute permission");
-                    return;
-                }
-            }catch (Exception e){
-                Log.d(TAG, "onCreate: permission error - "+e.getMessage());
+        try{
+            Process process = Runtime.getRuntime().exec("chmod -R 777 " + getFilesDir());
+            process.waitFor();
+            if (process.exitValue() != 0) {
+                Log.e(TAG, "Failed to set execute permission");
+                return;
             }
-
+        }catch (Exception e){
+            Log.d(TAG, "onCreate: permission error - "+e.getMessage());
         }
+        pjsipReceiver = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                Log.i(TAG, "ACTION_PJSIP_END_CALL received");
+                if (!isContinuousRecording) {
+                    toggleContinuousRecording(); // 녹음 및 분석 재시작
+                }
+            }
+        };
+//        keywordFetchReceiver = new BroadcastReceiver() {
+//            @Override
+//            public void onReceive(Context context, Intent intent) {
+//                Log.i(TAG, "키워드 동기화 요청(Broadcast) 수신");
+//                fetchAndApplyKeywordsFromControlServer();
+//            }
+//        };
+
+        registerReceiver(pjsipReceiver,intentFilter, Context.RECEIVER_EXPORTED);
+//        registerReceiver(keywordFetchReceiver,fetchFilter, Context.RECEIVER_EXPORTED);
+
+        // 키워드 자동 동기화
+        fetchAndApplyKeywordsFromControlServer();
+
         // Load garbage keywords from file
         loadGarbageKeywords();
+        voiceAiServer = new VoiceAINanoServer(getApplicationContext());
+        try {
+            voiceAiServer.start();
+            Log.i("VoiceAiNano", "NanoHTTPD started on port "+Settings.System.getInt(getContentResolver(), H500.Settings.WHITELIST_PORT, 8040));
+        } catch (IOException e) {
+            Log.e("VoiceAiNano", "Failed to start NanoHTTPD", e);
+        }
     }
     // Method to load keywords from /sdcard/Download/detected.txt or assets/detected.txt
     private void loadGarbageKeywords() {
         List<String> keywords = new ArrayList<>();
+        File sdcardFile = new File("/sdcard/Whisper/model/detected.txt");
 
-        // Try reading from /sdcard/Download/detected.txt
+        // 1. Try reading from /sdcard/Whisper/model/detected.txt
         try {
-            File file = new File("/sdcard/Download/detected.txt");
-            if (file.exists()) {
-                try (BufferedReader reader = new BufferedReader(new InputStreamReader(new FileInputStream(file)))) {
+            if (sdcardFile.exists()) {
+                try (BufferedReader reader = new BufferedReader(new InputStreamReader(new FileInputStream(sdcardFile)))) {
                     String line;
                     while ((line = reader.readLine()) != null) {
                         line = line.trim();
@@ -131,50 +156,60 @@ public class VoiceAIService extends Service {
                         }
                     }
                 }
+
                 if (!keywords.isEmpty()) {
                     garbageKeywords = keywords;
-                    Log.d(TAG, "Loaded " + garbageKeywords.size() + " garbage keywords from /sdcard/Download/detected.txt");
+                    Log.d(TAG, "✅ Loaded " + keywords.size() + " garbage keywords from /sdcard/Whisper/model/detected.txt");
                     return;
                 } else {
-                    Log.w(TAG, "/sdcard/Download/detected.txt is empty, falling back to assets");
+                    Log.w(TAG, "⚠️ /sdcard/Whisper/model/detected.txt is empty, falling back to assets.");
                 }
             } else {
-                Log.w(TAG, "/sdcard/Download/detected.txt not found, falling back to assets");
+                Log.w(TAG, "⚠️ /sdcard/Whisper/model/detected.txt not found, falling back to assets.");
             }
         } catch (SecurityException e) {
-            Log.e(TAG, "Permission denied reading /sdcard/Download/detected.txt: " + e.getMessage());
+            Log.e(TAG, "❌ Permission denied reading /sdcard/Whisper/model/detected.txt: " + e.getMessage());
         } catch (IOException e) {
-            Log.e(TAG, "Error reading /sdcard/Download/detected.txt: " + e.getMessage());
+            Log.e(TAG, "❌ Error reading /sdcard/Whisper/model/detected.txt: " + e.getMessage());
         }
 
-        // Try reading from assets/detected.txt
+        // 2. Try reading from assets/model/detected.txt and copy to sdcard
         try {
-            try (InputStream is = getAssets().open("detected.txt");
-                 BufferedReader reader = new BufferedReader(new InputStreamReader(is))) {
+            // ensure folder exists
+            File parentDir = sdcardFile.getParentFile();
+            if (!parentDir.exists()) parentDir.mkdirs();
+
+            try (
+                    InputStream is = getAssets().open("model/detected.txt");
+                    BufferedReader reader = new BufferedReader(new InputStreamReader(is));
+                    FileOutputStream fos = new FileOutputStream(sdcardFile)  // copy file to sdcard
+            ) {
                 String line;
                 while ((line = reader.readLine()) != null) {
                     line = line.trim();
                     if (!line.isEmpty()) {
                         keywords.add(line);
+                        fos.write((line + "\n").getBytes());  // write to copied file
                     }
                 }
+                fos.flush();
             }
+
             if (!keywords.isEmpty()) {
                 garbageKeywords = keywords;
-                Log.d(TAG, "Loaded " + garbageKeywords.size() + " garbage keywords from assets/detected.txt");
+                Log.d(TAG, "✅ Loaded " + keywords.size() + " garbage keywords from assets and copied to /sdcard/Whisper/model/detected.txt");
                 return;
             } else {
-                Log.w(TAG, "assets/detected.txt is empty, using default keywords");
+                Log.w(TAG, "⚠️ assets/model/detected.txt is empty, using default keywords.");
             }
+
         } catch (IOException e) {
-            Log.e(TAG, "Error reading assets/detected.txt: " + e.getMessage());
+            Log.e(TAG, "❌ Error reading or copying assets/model/detected.txt: " + e.getMessage());
         }
 
-        // Fall back to default keywords
-        garbageKeywords = new ArrayList<>(Arrays.asList(
-            "응응", "아아", "어어", "으으", "음음", "아이아이", "오오", "헤헤", "지금지금", "에에", "와우와우","그그"
-        ));
-        Log.d(TAG, "Using default " + garbageKeywords.size() + " garbage keywords");
+        // 3. Fall back to empty default
+        garbageKeywords = new ArrayList<>();
+        Log.w(TAG, "⚠️ Using default (empty) garbage keywords list.");
     }
         private Boolean getDetectedGarbageKeyword(String result) {
         if (garbageKeywords == null) {
@@ -193,11 +228,6 @@ public class VoiceAIService extends Service {
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
         Log.d(TAG, "Service started");
-
-        if (receiver == null) {
-            receiver = new VoiceAIService.MyBroadcastReceiver();
-            registerReceiver(receiver, intentFilter, Context.RECEIVER_EXPORTED);
-        }
 
         if (!isContinuousRecording) {
             toggleContinuousRecording();
@@ -238,14 +268,21 @@ public class VoiceAIService extends Service {
             Log.e(TAG, "setupFiles: "+e.getMessage() );
         }
         // 파일 설정 로직 (변경 없음)
+        // File modelDir = new File(getFilesDir(), "model");
+        // if (!modelDir.exists()) modelDir.mkdirs();
         File execDir = new File(getFilesDir(), "exec");
         if (!execDir.exists()) execDir.mkdirs();
-        File modelDir = new File(getFilesDir(), "model");
+        File modelDir = new File("/sdcard/Whisper/model");
         if (!modelDir.exists()) modelDir.mkdirs();
         File libDir = new File(getFilesDir(), "lib");
         if (!libDir.exists()) libDir.mkdirs();
         File audioDir = new File(getFilesDir(), "audio");
         if (!audioDir.exists()) audioDir.mkdirs();
+        File staticDir = new File(getFilesDir(), "static");
+        if (!staticDir.exists()) staticDir.mkdirs();
+        File keywordsDir = new File(getFilesDir(), "keywords");
+        if (!keywordsDir.exists()) keywordsDir.mkdirs();
+
 
         try {
             String[] libFiles = getAssets().list("lib");
@@ -261,53 +298,71 @@ public class VoiceAIService extends Service {
         }
 
         try {
-            String[] assetList = getAssets().list("");
-            if (assetList != null) {
-                for (String name : assetList) {
-                    if (name.startsWith("rknn")) {
-                        // 파일인지 확인 (폴더면 open 시도 시 IOException 발생)
-                        try (InputStream is = getAssets().open(name)) {
-                            // 파일로 간주하고 작업 진행
-                            File execFile = new File(execDir, name);
-                            if (!execFile.exists()) {
-                                try (FileOutputStream fos = new FileOutputStream(execFile)) {
-                                    byte[] buffer = new byte[1024];
-                                    int len;
-                                    while ((len = is.read(buffer)) != -1) {
-                                        fos.write(buffer, 0, len);
+            Log.d(TAG, "d :"+execDir.listFiles());
+            Log.d(TAG, ""+execDir.listFiles().length);
+
+            if (execDir.listFiles() == null || execDir.listFiles().length == 0) {
+                Log.d(TAG, "exec 디렉토리에 파일이 없습니다. rknn 파일 생성.");
+                // 1. 실행 파일 확인 및 복사 rknn으로 시작하는 파일이 없으면 기본 실행파일을 가져온다.
+                String[] assetList = getAssets().list("");
+                if (assetList != null) {
+                    for (String name : assetList) {
+                        if (name.startsWith("rknn")) {
+                            // 파일인지 확인 (폴더면 open 시도 시 IOException 발생)
+                            try (InputStream is = getAssets().open(name)) {
+                                // 파일로 간주하고 작업 진행
+                                File execFile = new File(execDir, name);
+                                if (!execFile.exists()) {
+                                    try (FileOutputStream fos = new FileOutputStream(execFile)) {
+                                        byte[] buffer = new byte[1024];
+                                        int len;
+                                        while ((len = is.read(buffer)) != -1) {
+                                            fos.write(buffer, 0, len);
+                                        }
                                     }
+                                    Log.d(TAG, "Copied exec file: " + name);
                                 }
-                                Log.d(TAG, "Copied exec file: " + name);
+                            } catch (IOException e) {
+                                // 폴더거나 파일이 아니므로 무시
+                                Log.d(TAG, name + " is not a file, skipped.");
                             }
-                        } catch (IOException e) {
-                            // 폴더거나 파일이 아니므로 무시
-                            Log.d(TAG, name + " is not a file, skipped.");
                         }
                     }
                 }
+            } else {
+                Log.d(TAG, "rknn file checked");
             }
 
+            //  2. 모델 파일 확인 및 복사
+            try {
+                File[] existingFiles = modelDir.listFiles();
+                if (existingFiles == null || existingFiles.length <= 1) {
+                    Log.d(TAG, "모델 디렉토리에 파일이 없어 복사 시작");
 
-            String[] modelFiles = getAssets().list("model");
-            if (modelFiles != null) {
-                for (String modelFile : modelFiles) {
-                    File destModelFile = new File(modelDir, modelFile);
-                    if (!destModelFile.exists()) {
-                        try (InputStream is = getAssets().open("model/" + modelFile);
-                             FileOutputStream fos = new FileOutputStream(destModelFile)) {
-                            byte[] buffer = new byte[1024];
-                            int len;
-                            while ((len = is.read(buffer)) != -1) {
-                                fos.write(buffer, 0, len);
+                    String[] modelFiles = getAssets().list("model");
+                    for (String modelFileName : modelFiles) {
+                        File modelFile = new File(modelDir, modelFileName);
+                        if (!modelFile.exists()) {
+                            try (InputStream is = getAssets().open("model/" + modelFileName);
+                                FileOutputStream fos = new FileOutputStream(modelFile)) {
+                                byte[] buffer = new byte[1024];
+                                int len;
+                                while ((len = is.read(buffer)) != -1) {
+                                    fos.write(buffer, 0, len);
+                                }
+                                Log.d(TAG, "복사된 모델 파일: " + modelFile.getAbsolutePath());
                             }
-                            Log.d(TAG, "Copied model file: " + modelFile);
                         }
                     }
+                } else {
+                    Log.d(TAG, "model file checked");
                 }
+            } catch (IOException e) {
+                Log.e(TAG, "모델 파일 복사 실패: " + e.getMessage());
             }
 
             String[] libFiles = {"librga.so", "librknnrt.so"};
-            for (String libFile : libFiles) {
+            for (String libFile : libFiles) {//
                 File destLibFile = new File(libDir, libFile);
                 if (!destLibFile.exists()) {
                     try (InputStream is = getAssets().open("lib/" + libFile);
@@ -320,11 +375,46 @@ public class VoiceAIService extends Service {
                     }
                 }
             }
+
+            String[] staticFiles = getAssets().list("static");
+            for (String staticFile : staticFiles) {
+                File destStaticFile = new File(staticDir, staticFile);
+                if (!destStaticFile.exists()) {
+                    Log.d(TAG, destStaticFile.getAbsolutePath());
+                    try (InputStream is = getAssets().open("static/" + staticFile);
+                        FileOutputStream fos = new FileOutputStream(destStaticFile)) {
+                        byte[] buffer = new byte[1024];
+                        int len;
+                        while ((len = is.read(buffer)) != -1) {
+                            fos.write(buffer, 0, len);
+                        }
+                    }
+                }
+            }
+
+
+            File keywordMapFile = new File(keywordsDir, "keyword_map.json");
+            if (!keywordMapFile.exists()) {
+                try (InputStream is = getAssets().open("keywords/keyword_map.json");
+                     FileOutputStream fos = new FileOutputStream(keywordMapFile)) {
+                    byte[] buffer = new byte[1024];
+                    int len;
+                    while ((len = is.read(buffer)) != -1) {
+                        fos.write(buffer, 0, len);
+                    }
+                    Log.d(TAG, "keyword_map.json 파일 복사 완료");
+                } catch (IOException e) {
+                    Log.e(TAG, "백업 파일 복사 실패: " + e.getMessage());
+                }
+                KeywordManager.load(getApplicationContext()); // 화이트 리스트 적용
+            }
+
             Process process = Runtime.getRuntime().exec("chmod -R 777 " + getFilesDir());
             process.waitFor();
             if (process.exitValue() != 0) {
                 Log.e(TAG, "Failed to set execute permission");
             }
+
         } catch (Exception e) {
             Log.e(TAG, "Setup failed: " + e.getMessage());
         }
@@ -332,9 +422,13 @@ public class VoiceAIService extends Service {
 
 
     private String generateAudioFileName() {
-        SimpleDateFormat sdf = new SimpleDateFormat("yyyyMMdd_HH-mm-ss");
+        SimpleDateFormat sdf = new SimpleDateFormat("yyMMdd_HH-mm-ss");
         String timestamp = sdf.format(new Date());
-        return "voice_" + timestamp + ".wav";
+        String lineNumber = Settings.System.getString(getContentResolver(), H500.Settings.SIP_LINE_NUMBER);
+        if (lineNumber.isEmpty()){
+            lineNumber = "unknown";
+        }
+        return "voice_" + lineNumber + "_" + timestamp + ".wav";
     }
 
     private void manageAudioFiles() {
@@ -362,9 +456,9 @@ public class VoiceAIService extends Service {
         } else {
             isContinuousRecording = false;
             handler.removeCallbacksAndMessages(null);
-            stopRecording(null);
             Log.d(TAG, "Continuous recording stopped at " + System.currentTimeMillis());
             handler.post(() -> {
+                stopRecording(null);
             });
         }
     }
@@ -522,11 +616,13 @@ public class VoiceAIService extends Service {
 
     private void analyzeNextAudio() {
         if (audioFileQueue.isEmpty()) {
+            scheduleNextRecordingIfNeeded();
             return;
         }
 
         String audioFile = audioFileQueue.poll();
         if (audioFile == null) {
+            scheduleNextRecordingIfNeeded();
             return;
         }
         // === 파일 크기 검사 추가 ===
@@ -536,19 +632,82 @@ public class VoiceAIService extends Service {
         long fileSize = audioPathFile.length();
         if (fileSize == 0) {
             Log.e(TAG, "분석할 음성 파일이 비어있음: " + audioFile);
+            scheduleNextRecordingIfNeeded();
             return;
-        } else if (fileSize < 100) {
-            Log.e(TAG, "분석할 음성 파일 크기가 비정상적으로 작음 (" + fileSize + " bytes): " + audioFile);
+        }
+        else if (fileSize < 100) {
+            Log.e(TAG, "분석할 음성 파일 크기가 작음. pass (" + fileSize + " bytes): " + audioFile);
+            scheduleNextRecordingIfNeeded();
             return;
         }
 
+        // 모델 크기 출력 0618
+        MediaMetadataRetriever mmr = new MediaMetadataRetriever();
+        try {
+            mmr.setDataSource(audioPathFile.getPath());
+            String durationStr = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION);
+            long durationMs = Long.parseLong(durationStr);
+            long durationSec = durationMs / 1000;
+            Log.d(TAG, "음성 길이: " + durationSec + "초 (" + durationMs + "ms)");
+
+            // 예시: 너무 짧으면 분석 생략
+            if (durationSec < 1) {
+                Log.e(TAG, "음성 파일 길이가 너무 짧음: " + durationSec + "초");
+                scheduleNextRecordingIfNeeded();
+                return;
+            }
+
+        } catch (Exception e) {
+            Log.e(TAG, "오디오 길이 측정 실패: " + e.getMessage());
+        } finally {
+            try {
+                mmr.release();
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+        }
+        // 모델 크기 출력0618
+
+//        long lastModified = audioPathFile.lastModified();
+//        long now = System.currentTimeMillis();
+//        if ((now - lastModified) < 1000) {
+//            Log.w(TAG, "작은 파일 분석 생략: " + audioFile);
+//            scheduleNextRecordingIfNeeded();
+//            return;
+//        }
+
 //        Log.d(TAG, "Submitting analysis for: " + audioFile + " at " + System.currentTimeMillis());
         analysisExecutor.submit(() -> {
+            // File modelDir = new File(getFilesDir(), "model");
+            // String encoderPath = new File(modelDir, SELECTED_ENCODER).getAbsolutePath();
+            // String decoderPath = new File(modelDir, SELECTED_DECODER).getAbsolutePath();
             File execFile = new File(getFilesDir(), "exec/rknn_whisper_demo_base_10s_static");
             String execPath = execFile.getAbsolutePath();
-            File modelDir = new File(getFilesDir(), "model");
-            String encoderPath = new File(modelDir, SELECTED_ENCODER).getAbsolutePath();
-            String decoderPath = new File(modelDir, SELECTED_DECODER).getAbsolutePath();
+            File modelDir = new File("/sdcard/Whisper/model");
+            File[] modelFiles = modelDir.listFiles();
+            String encoderPath = null;
+            String decoderPath = null;
+
+            if (modelFiles != null) {
+                for (File file : modelFiles) {
+                    String name = file.getName().toLowerCase();
+
+                    if (encoderPath == null && name.contains("encoder")) {
+                        encoderPath = file.getAbsolutePath();
+                    } else if (decoderPath == null && name.contains("decoder")) {
+                        decoderPath = file.getAbsolutePath();
+                    }
+
+                    if (encoderPath != null && decoderPath != null) {
+                        break; // 둘 다 찾았으면 종료
+                    }
+                }
+            }
+            if (encoderPath == null || decoderPath == null) {
+                Log.e(TAG, "모델 파일 중 encoder 또는 decoder가 없습니다.");
+                return;
+            }
+            
             String lang = SELECTED_VOCAB.replace("vocab_", "").replace(".txt", "");
             String audioPath = new File(new File(getFilesDir(), "audio"), audioFile).getAbsolutePath();
             String libPath = new File(getFilesDir(), "lib").getAbsolutePath();
@@ -561,25 +720,25 @@ public class VoiceAIService extends Service {
             long startTime = System.currentTimeMillis();
             try {
                 String result = executeWhisperDemo(execPath, encoderPath, decoderPath, lang, audioPath, libPath);
-                String cleanedResult = result.replace(" ", "").replace(".", "").replace("?", "").replace("!", "");
+                String cleanedResult = result.replace(" ", "").replace(".", "").replace("?", "").replace("!", "").replace("~", "");
                 long duration = (System.currentTimeMillis() - startTime) / 1000;
                 //2초가 넘는 유의미한 텍스트인지 확인
                 if (duration != 1 && !result.startsWith("No Whisper") && !result.startsWith("Error:") && cleanedResult.length() >= 2){
-                    // 위험 감지 키워드 검사
-                    if (containsEmergencyKeyword(cleanedResult)) {
-                        Log.d(TAG, "Emergency keyword detected:" + result);
-                        String detectedKeyword = getDetectedKeyword(cleanedResult); // 검출된 키워드 추출
-                        sendToServer(audioFile, result, detectedKeyword, duration);
-                        saveToAudio2Folder(audioFile, result); // audio2 폴더에 만들어서 위험감지 wav를 저장하는 기능. 디버그 용
-                        // toggleContinuousRecording(); // 통화를 한다면 녹음 및 분석 중지
-                        // sendBroadcast(new Intent(H500.Intent.ACTION_PJSIP_MAKE_CALL), H500.Permission.H500_BROADCAST_PERMISSION);
-                        // Log.w(TAG,"관제센터로 연결합니다.");
                     // 필요없는 텍스트 감지인지 확인하고 서버 전송
-                    } else if (!getDetectedGarbageKeyword(cleanedResult)){
-                        sendToServer(audioFile, result, "not_detected", duration);
-                        saveToAudio2Folder(audioFile, result);
-                    } else {
-                        Log.i(TAG, audioFile.replace(".wav", "") + " - " + result + " [Invalid message] [ Analysis delay: "  + duration + "s]");
+                    if (!getDetectedGarbageKeyword(cleanedResult)){
+                        String detectedKeyword = KeywordManager.matchEmergencyKeyword(cleanedResult);
+                        if (detectedKeyword.equals("not_detected")){
+                            Log.d(TAG, "Emergency keyword not detected:" + detectedKeyword);
+                            sendToServer(audioFile, result, "not_detected", duration, encoderPath); //화이트리스트만 서버에 전송하기
+                            Log.i(TAG, audioFile.replace(".wav", "") + " - " + result + " [Invalid message] [ Analysis delay: "  + duration + "s]");
+                        } else if (!detectedKeyword.isEmpty()){
+                            Log.d(TAG, "Emergency keyword detected:" + detectedKeyword);
+                            Log.i(TAG, audioFile.replace(".wav", "") + " - " + result + " [ message] [ Analysis delay: "  + duration + "s]");
+//                        toggleContinuousRecording(); // 통화를 한다면 녹음 및 분석 중지
+                            sendToServer(audioFile, result, detectedKeyword, duration, encoderPath);
+//                        sendBroadcast(new Intent(H500.Intent.ACTION_PJSIP_MAKE_CALL), H500.Permission.H500_BROADCAST_PERMISSION);
+//                        Log.w(TAG,"관제센터로 연결합니다.");
+                        }
                     }
                 } else {
                     Log.i(TAG, audioFile.replace(".wav", "") + " - " + (result.isEmpty() ? "No output" : result) + " [ Analysis delay: "  + duration + "s]");
@@ -593,152 +752,29 @@ public class VoiceAIService extends Service {
             long elapsedTime = endTime - startTime;
             long delay = Math.max(0, 3000 - elapsedTime);// 최소 녹음시간 3초 보장. 학습용으로
 
+            // 위험 상황이 감지되어 녹음이 중단되었으면 다음 분석을 예약하지 않음
+            if (!isContinuousRecording || !isRecording) {
+                return;
+            }
+
             // 분석 완료 후 최소 3초 보장 후 녹음 종료 및 재시작
             handler.postDelayed(() -> {
                 if (isContinuousRecording && isRecording) {
                     stopRecording(currentRecordingFile);
-                    startRecordingAndAnalysis(); // 분석 끝난 후 즉시 재녹음 및 분석
+                    startRecordingAndAnalysis();
                 }
             }, delay);
-//            });
         });
     }
-    private boolean containsEmergencyKeyword(String result) {
-        String[] keywords = {"살려", "살려줘", "살려주", "사람살려", "산려주", "산려줘", "선려주", "선려줘", "살여주", "살여줘", "설여주", "설여줘", "사려주", "사려줘","살리어주","살리어줘",
-                             "서려주", "서려줘", "살요주", "살요줘", "쌀려주", "쌀여주", "산여주", "산여줘", "설려주", "설려줘", "할려주", "할려줘", "사리어주","사리어줘", "쌀려줘", "쌀여줘",
-                             "도와", "도와주", "도와줘", "도아주", "도아줘" , "동아주", "도하주", "도하줘", "더워주", "더워줘", "도마주", "도마줘", "도워주", "도워줘", "동아줘",
-                             "더와주","더와줘" };
-        for (String keyword : keywords) {
-            if (result.contains(keyword)) {
-                return true;
-            }
-        }
-        return false;
-    }
 
-    private String getDetectedKeyword(String result) {
-
-        // 살려주세요
-        String[] saveKeywords = {"살려", "살려주", "산려주", "살리어주", "선려주", "살여주", "설여주", "사려주", "사리어주", "서려주", "살요주", "쌀려주", "쌀여주", "할려주", "산여주", "설려주"};
-
-        // 살려줘요
-        String[] saveKeywords2 = {"살려줘", "산려줘", "살리어줘", "선려줘", "살여줘", "설여줘", "사려줘", "사리어줘", "서려줘", "살요줘", "쌀려줘", "쌀여줘", "할려줘", "산여줘", "설려줘"};
-
-        // "도와" 관련 키워드 그룹
-        String[] helpKeywords = {"도와", "도와주", "도아주", "동아주", "도하주", "더워주", "도마주", "더와주", "도워주"};
-
-        String[] helpKeywords2 = {"도와줘", "도아줘", "동아줘", "도하줘", "더워줘", "도마줘", "더와줘", "도워줘"};
-
-
-        //1. "살려" 그룹 체크
-        for (String keyword : saveKeywords) {
-            if (result.contains(keyword)) {
-                return "살려주세요"; // "살려" 관련 키워드 감지 시 "살려주세요" 반환
-            }
-        }
-        for (String keyword : saveKeywords2) {
-            if (result.contains(keyword)) {
-                return "살려줘요"; // "살려" 관련 키워드 감지 시 "살려주세요" 반환
-            }
-        }
-        //2. "도와" 그룹 체크
-        for (String keyword : helpKeywords) {
-            if (result.contains(keyword)) {
-                return "도와주세요"; // "도와주" 관련 키워드 감지 시 "도와주세요" 반환
-            }
-        }
-        for (String keyword : helpKeywords2) {
-            if (result.contains(keyword)) {
-                return "도와줘요"; // "도와줘" 관련 키워드 감지 시 "도와줘요" 반환
-            }
-        }
-        if (result.contains("사람살려")){
-            return "사람살려";
-        } 
-        return ""; // 매칭되는 키워드가 없으면 빈 문자열 반환
-    }
-
-    // private Boolean getDetectedGarbageKeyword(String result) {
-    //     String[] GarbageKeyword = {"응응", "아아", "어어", "으으", "음음", "아이아이", "오오", "헤헤", "지금지금", "에에", "아이아이","와우와우"};
-    //     Boolean isGarbageTranscripts = false;
-    //     for (String keyword : GarbageKeyword) {
-    //         if (result.contains(keyword)) {
-    //             isGarbageTranscripts = true;
-    //             break;
-    //         }
-    //     }
-    //     return isGarbageTranscripts;
-    // }
-
-    private void saveToAudio2Folder(String audioFile, String detectedKeyword) {
-        try {
-            // audio2 폴더 생성
-            File audio2Dir = new File(getFilesDir(), "audio2");
-            if (!audio2Dir.exists()) {
-                audio2Dir.mkdirs();
-            }
-
-            // 원본 파일
-            File sourceFile = new File(getFilesDir(), "audio/" + audioFile);
-
-            // 새 파일명 생성 (검출 키워드 추가)
-            String newFileName = audioFile.replace(".wav", "_" + detectedKeyword + ".wav");
-            File destFile = new File(audio2Dir, newFileName);
-
-            // 파일 이동
-            if (sourceFile.renameTo(destFile)) {
-                Log.d(TAG, "File moved to audio2 folder: " + destFile.getAbsolutePath());
-            } else {
-                Log.e(TAG, "Failed to move file to audio2 folder: " + newFileName);
-            }
-        } catch (Exception e) {
-            Log.e(TAG, "Error saving to audio2 folder: " + e.getMessage());
-        }
-    }
-
-/*    private void saveToAudio2Folder(String audioFile, String detectedKeyword) { // 기기에도 wav를 저장한다면 파일 이동 부분 주석해제
-        try {
-            // audio2 폴더 생성
-//            File audio2Dir = new File(getFilesDir(), "audio2");
-//            if (!audio2Dir.exists()) {
-//                audio2Dir.mkdirs();
-//            }
-
-            // 원본 파일
-            File sourceFile = new File(getFilesDir(), "audio/" + audioFile);
-
-//            // 새 파일명 생성 (검출 키워드 추가)
-//            String newFileName = audioFile.replace(".wav", "_" + detectedKeyword + ".wav");
-//            File destFile = new File(audio2Dir, newFileName);
-
-            // 새 파일명 생성 (원본 파일명 유지)
-//            String newFileName = audioFile;
-//            File destFile = new File(audio2Dir, newFileName);
-
-            // 파일 이동
-//            if (sourceFile.renameTo(destFile)) {
-            if (sourceFile.isFile()) {
-//                Log.d(TAG, "File moved to audio2 folder: " + sourceFile.getAbsolutePath());
-                Log.d(TAG, "File path & name: " + sourceFile.getAbsolutePath());
-                // 서버로 Base64 인코딩된 파일과 함께 전송
-                sendToServer(audioFile, detectedKeyword, sourceFile);
-//                sendToServer(newFileName, detectedKeyword, destFile);
-            } else {
-                Log.e(TAG, "Failed to move file to audio2 folder: " + audioFile);
-            }
-        } catch (Exception e) {
-            Log.e(TAG, "Error saving to audio2 folder: " + e.getMessage());
-        }
-    }
-*/
-    private void sendToServer(String fileName, String transcripts, String detectedText, long duration) {
+    private void sendToServer(String fileName, String transcripts, String detectedText, long duration, String encoderPath) { // 2025-05-21 인코더 파일명 추출해서 버전명 서버로 보내는 기능 추가
         File audioFile = new File(getFilesDir(), "audio/" + fileName);
         // Log.d(TAG, "\n========= Send voice messages ===================\nFile : " + audioFile.getAbsolutePath());
         Log.d(TAG, "========= Send voice messages ===================");
         // Log.i(TAG, "Analysis delay: "+ duration + "s");
         if (!detectedText.equals("not_detected")){
             Log.w(TAG,"※ 관제 센터로 위험이 감지된 메시지를 보냅니다. ※\nAnalysis delay: "+ duration + "s\nMessage: [ "+ detectedText + " ]");
-        } else{
+        } else {
             Log.w(TAG,"※ 관제 센터로 감지된 메시지를 보냅니다. ※\nAnalysis delay: "+ duration + "s\nMessage: [ " + transcripts + " ]" );
         }
 
@@ -749,9 +785,11 @@ public class VoiceAIService extends Service {
         // 파일을 Base64로 인코딩
         String base64Audio;
         try {
-            base64Audio = encodeFileToBase64(audioFile);
+            base64Audio = VoiceAIUtil.encodeFileToBase64(audioFile);
             // Log.d(TAG, "Base64 encoded data sample: " + base64Audio.substring(0, Math.min(50, base64Audio.length())));
             // Log.d(TAG, "WAV encoding complete.");
+//             Log.d(TAG, base64Audio);
+
         } catch (Exception e) {
             Log.e(TAG, "Failed to encode file to Base64: " + e.getMessage() + "\n" + LOG_SEPARATOR);
             return;
@@ -760,6 +798,52 @@ public class VoiceAIService extends Service {
         int port = Settings.System.getInt(getContentResolver(), H500.Settings.ADMIN_SERVER_PORT, 8080);
         String serverIp = Settings.System.getString(getContentResolver(), H500.Settings.SIP_SERVER);
         String lineNumber = Settings.System.getString(getContentResolver(), H500.Settings.SIP_LINE_NUMBER);
+
+        // mk 빌드 방식에서 주석 해제할것
+//        String sipRegistStatus = SystemProperties.get("tcc.selfCheck.sipRegistStatus", "0");
+//        if (!sipRegistStatus.equals("1")){
+//            Log.e(TAG, "SIP가 연결 되어 있지 않습니다. 전송을 중단합니다.");
+//            stopRecording(null);
+//            Settings.System.putInt(getContentResolver(), H500.Settings.VOICE_AI_STATE, 0);
+//            new Handler(Looper.getMainLooper()).postDelayed(() -> {
+//                Log.w(TAG, "SIP NULL - VoiceAIService 종료");
+//                stopSelf();
+//            }, 1000);
+//            return;
+//        }
+
+        if (serverIp == null || serverIp.isEmpty()) {
+            Log.e(TAG, "서버 IP가 설정되어 있지 않습니다. 전송을 중단합니다.");
+            stopRecording(null);
+            Settings.System.putInt(getContentResolver(), H500.Settings.VOICE_AI_STATE, 0);
+            new Handler(Looper.getMainLooper()).postDelayed(() -> {
+                Log.e(TAG, "SERVER IP NULL - VoiceAIService 종료");
+                stopSelf();
+            }, 1000);
+            return;
+        }
+
+        if (lineNumber == null || lineNumber.isEmpty()) {
+            Log.e(TAG, "내선 번호가 설정되어 있지 않습니다. 전송을 중단합니다.");
+            stopRecording(null);
+            Settings.System.putInt(getContentResolver(), H500.Settings.VOICE_AI_STATE, 0);
+            new Handler(Looper.getMainLooper()).postDelayed(() -> {
+                Log.e(TAG, "SIP NULL - VoiceAIService 종료");
+                stopSelf();
+            }, 1000);
+            return;
+        }
+
+        // lch std 2025-05-21 서버에 버전명 전송 추가
+        // ex) String path = "/sdcard/Whisper/model/0.2_encoder.rknn";
+        String[] partsBySlash = encoderPath.split("/");
+        // ex) [ "", "sdcard", "Whisper", "model", "0.2_encoder.rknn" ] 
+        String modelName = partsBySlash[partsBySlash.length - 1]; // 마지막 요소 = "0.2_encoder.rknn"
+        String[] partsByUnderscore = modelName.split("_");
+        // ex [ "0.2", "encoder.rknn" ]
+        String versionName = partsByUnderscore[0];
+
+
 
         // JSON 데이터 생성
         JSONObject jsonObject = new JSONObject();
@@ -774,9 +858,10 @@ public class VoiceAIService extends Service {
             jsonObject.put("transcripts", transcripts); // 감지된 키워드
             if (detectedText.equals("not_detected")){
                 jsonObject.put("label", ""); // 감지된 위험키워드가 없다면 일반 키워드 
-            } else{
+            } else {
                 jsonObject.put("label", detectedText); // 감지된 위험 키워드
             }
+            jsonObject.put("version", versionName); // 모델 버전
         } catch (Exception e) {
             Log.e(TAG, "Failed to create JSON: " + e.getMessage() + "\n" + LOG_SEPARATOR);
             return;
@@ -789,6 +874,7 @@ public class VoiceAIService extends Service {
             "fileName": "voice_20250331_14-30-45_도와줘.wav",
             "transcripts": "도와줘",
             "label": "도와"
+            "version": "1.7"
         */
 
         // 서버 URL 
@@ -808,7 +894,7 @@ public class VoiceAIService extends Service {
 
         // 비동기 요청 실행
         new Thread(() -> {
-            Log.d(TAG, "Message info: src-" + lineNumber + ", audio-"+ fileName + ", date-" +callDate + "\nServer url: " + serverUrl);
+            Log.d(TAG, "Message info: src-" + lineNumber + ", audio-"+ fileName + ", version-"+ versionName + ", date-" +callDate + "\nServer url: " + serverUrl);
             try (Response response = okHttpClient.newCall(request).execute()) {
                 if (response.isSuccessful()) {
                     String responseBody = Objects.requireNonNull(response.body()).string();
@@ -822,22 +908,6 @@ public class VoiceAIService extends Service {
         }).start();
     }
 
-    // 인코딩
-    private String encodeFileToBase64(File file) throws Exception {
-        FileInputStream fileInputStream = new FileInputStream(file);
-        byte[] bytes = new byte[(int) file.length()];
-        int bytesRead = fileInputStream.read(bytes);
-        fileInputStream.close();
-
-        if (bytesRead != file.length()) {
-            Log.e(TAG, "Failed to read entire file: expected " + file.length() + ", read " + bytesRead);
-            throw new Exception("Incomplete file read");
-        }
-
-        // NO_WRAP 옵션으로 줄바꿈 제거
-        String base64String = Base64.encodeToString(bytes, Base64.NO_WRAP);
-        return base64String;
-    }
 
     public native String executePermission(String path);
     public native String executeWhisperDemo(String execPath, String encoderPath, String decoderPath,
@@ -849,10 +919,14 @@ public class VoiceAIService extends Service {
         isContinuousRecording = false;
         handler.removeCallbacksAndMessages(null);
         stopRecording(null); // Call stopRecording even if audioRecord is null to ensure cleanup
-        if (receiver != null) {
-            unregisterReceiver(receiver);
-            receiver = null;
+        if (pjsipReceiver != null) {
+            unregisterReceiver(pjsipReceiver);
+            pjsipReceiver = null;
         }
+//        if (keywordFetchReceiver != null) {
+//            unregisterReceiver(keywordFetchReceiver);
+//            keywordFetchReceiver = null;
+//        }
         if (!analysisExecutor.isShutdown()) {
             analysisExecutor.shutdown();
         }
@@ -861,10 +935,7 @@ public class VoiceAIService extends Service {
         // if (audioRecord != null) {
         //     stopRecording(null);
         // }
-        // if (receiver != null) {
-        //     unregisterReceiver(receiver);
-        //     receiver = null;
-        // }
+
         // analysisExecutor.shutdown();
 
         // OkHttpClient 리소스 정리
@@ -873,20 +944,107 @@ public class VoiceAIService extends Service {
             okHttpClient.connectionPool().evictAll();
             Log.d(TAG, "OkHttpClient resources cleaned up");
         }
-    }
 
-    private class MyBroadcastReceiver extends BroadcastReceiver {
-        @Override
-        public void onReceive(Context context, Intent intent) {
-            if (intent.getAction().equals(H500.Intent.ACTION_PJSIP_END_CALL)) {
-                Log.i(TAG, "ACTION_PJSIP_END_CALL received");
-
-                if (!isContinuousRecording) {
-                    toggleContinuousRecording(); // 녹음 및 분석 재시작
-                }
-            }
+        // NanoServer도 종료
+        if (voiceAiServer != null) {
+            voiceAiServer.stop();
+            Log.d(TAG, "NanoServer stopped");
         }
+
+        // 관제 서버로 종료 알림 전송
+//        new Thread(() -> {
+//            String url = "http://10.10.10.51:8080/ebm_admin/getVoiceAiOnOff.cors?src=5000&voiceActive=false";
+//            OkHttpClient client = new OkHttpClient();
+//            Request request = new Request.Builder().url(url).build();
+//            try (Response response = client.newCall(request).execute()) {
+//                if (response.isSuccessful()) {
+//                    Log.i(TAG, "관제 서버에 종료 상태 전송 완료");
+//                } else {
+//                    Log.w(TAG, "관제 서버 응답 오류: " + response.code());
+//                }
+//            } catch (Exception e) {
+//                Log.e(TAG, "관제 서버 전송 실패: " + e.getMessage());
+//            }
+//        }).start(); // 네트워크는 반드시 별도 스레드에서 수행
     }
 
+
+    private void scheduleNextRecordingIfNeeded() {
+
+        handler.postDelayed(() -> {
+            if (isContinuousRecording && isRecording) {
+                stopRecording(currentRecordingFile);
+                startRecordingAndAnalysis();
+            }
+        }, 3000);
+    }
+
+    private void fetchAndApplyKeywordsFromControlServer() {
+        String serverIp = Settings.System.getString(getContentResolver(), H500.Settings.SIP_SERVER);
+        String lineNumber = Settings.System.getString(getContentResolver(), H500.Settings.SIP_LINE_NUMBER);
+        int port = Settings.System.getInt(getContentResolver(), H500.Settings.ADMIN_SERVER_PORT, 8080);
+        Log.w(TAG, "관제 서버로 부터 whitelist 동기화를 진행합니다.");
+
+        // mk 빌드시 주석 해제할 것
+//        String sipRegistStatus = SystemProperties.get("tcc.selfCheck.sipRegistStatus", "0");
+//        if (!sipRegistStatus.equals("1")){
+//            Log.e(TAG, "SIP가 연결 되어 있지 않습니다. 전송을 중단합니다.");
+//            stopRecording(null);
+//              Settings.System.putInt(getContentResolver(), H500.Settings.VOICE_AI_STATE, 0);
+//            new Handler(Looper.getMainLooper()).postDelayed(() -> {
+//                Log.w(TAG, "SIP NULL - VoiceAIService 종료");
+//                stopSelf();
+//            }, 1000);
+//            return;
+//        }
+
+        if (serverIp == null || serverIp.isEmpty()) {
+            Log.e(TAG, "서버 IP가 설정되어 있지 않습니다. 동기화를 중단합니다.");
+            stopRecording(null);
+            Settings.System.putInt(getContentResolver(), H500.Settings.VOICE_AI_STATE, 0);
+            new Handler(Looper.getMainLooper()).postDelayed(() -> {
+                Log.w(TAG, "SERVER IP NULL - VoiceAIService 종료");
+                stopSelf();
+            }, 1000);
+            return;
+        }
+
+        if (lineNumber == null || lineNumber.isEmpty()) {
+            Log.e(TAG, "내선 번호가 설정되어 있지 않습니다. 동기화를 중단합니다.");
+            stopRecording(null);
+            Settings.System.putInt(getContentResolver(), H500.Settings.VOICE_AI_STATE, 0);
+            new Handler(Looper.getMainLooper()).postDelayed(() -> {
+                Log.w(TAG, "SIP NULL - VoiceAIService 종료");
+                stopSelf();
+            }, 1000);
+            return;
+        }
+
+        String controlServerUrl = "http://"+ serverIp + ":" + port + "/ebm_admin/getVoiceAiKeyword.cors";
+
+        new Thread(() -> {
+            try {
+                Request request = new Request.Builder()
+                        .url(controlServerUrl)
+                        .get()
+                        .build();
+
+                Response response = okHttpClient.newCall(request).execute();
+                if (response.isSuccessful()) {
+                    String responseBody = Objects.requireNonNull(response.body()).string();
+
+                    JSONObject keywordJson = new JSONObject(responseBody);
+                    JSONObject keywordMap = KeywordManager.convertKeywordListFormat(keywordJson);
+
+                    KeywordManager.sync(getApplicationContext(), keywordMap);
+                    Log.i(TAG, "✅ 키워드 동기화 완료 " + keywordMap);
+                } else {
+                    Log.e(TAG, "❌ 키워드 동기화 실패: HTTP " + response.code());
+                }
+            } catch (Exception e) {
+                Log.e(TAG, "❌ 키워드 동기화 중 오류: " + e.getMessage());
+            }
+        }).start();
+    }
 
 }
